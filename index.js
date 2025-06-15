@@ -43,7 +43,7 @@ app.post('/api/users/push-token', authenticateUser, async (req, res) => {
 app.post('/api/admins/push-token', authenticateUser, async (req, res) => {
   try {
     const { token } = req.body;
-    console.log(`[API] Received admin push token: ${token}`);
+
     const admin = await Admin.findById(req.user.adminId);
     if (!admin) return res.status(404).json({ message: 'Admin not found.' });
     admin.pushToken = token;
@@ -68,6 +68,43 @@ cron.schedule('*/30 * * * *', async () => {
   } catch (err) {
     console.error('[CRON] Failed to send offer notifications:', err);
   }
+});
+
+// Root URL: Show backend info and features
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+      <head>
+        <title>Coms-Again Backend</title>
+        <style>
+          body { font-family: Arial, sans-serif; background: #f8f9fa; color: #222; margin: 0; padding: 0; }
+          .container { max-width: 800px; margin: 40px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px #0001; padding: 32px; }
+          h1 { color: #2a5d9f; }
+          ul { line-height: 1.7; }
+          .subtitle { color: #555; margin-bottom: 24px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>Coms-Again Backend</h1>
+          <div class="subtitle">This is the backend for the Android and Web application. It is a dynamic website with all the features listed below.</div>
+          <h2>Features</h2>
+          <ul>
+            <li><b>User & Admin Authentication</b> (JWT, registration, login, profile management)</li>
+            <li><b>Product Management</b> (CRUD, image upload, reviews)</li>
+            <li><b>Order Management</b> (create, update, cancel, payment status, admin controls)</li>
+            <li><b>Wishlist & Cart</b> (add, remove, clear, update, fetch)</li>
+            <li><b>Coupon System</b> (create, update, delete, validate, list)</li>
+            <li><b>Push Notifications</b> (order status, new orders, scheduled offers)</li>
+            <li><b>Scheduled Tasks</b> (offer notifications every 30 minutes)</li>
+            <li><b>RESTful API</b> for Android and Web clients</li>
+            <li><b>Admin Dashboard Support</b> (user/order management)</li>
+          </ul>
+          <p style="margin-top:32px;color:#888;font-size:14px;">&copy; 2025 Coms-Again. All rights reserved.</p>
+        </div>
+      </body>
+    </html>
+  `);
 });
 
 const PORT = process.env.PORT || 5000;
