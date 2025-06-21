@@ -1,0 +1,25 @@
+@import "tailwindcss";  
+
+:root {
+  /* Green color palette */
+  --primary-50: #f0fdf4;
+  --primary-100: #dcfce7;
+  --primary-200: #bbf7d0;
+  --primary-300: #86efac;
+  --primary-400: #4ade80;
+  --primary-500: #22c55e; /* Main primary green */
+  --primary-600: #16a34a;
+  --primary-700: #15803d;
+  --primary-800: #166534;
+  --primary-900: #14532d;
+
+  /* Dark mode variables */
+  --dark-primary-400: #4ade80;
+  --dark-primary-500: #22c55e;
+}
+
+/* Dark mode colors */
+[data-theme="dark"] {
+  --primary-400: var(--dark-primary-400);
+  --primary-500: var(--dark-primary-500);
+}

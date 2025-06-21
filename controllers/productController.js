@@ -1,6 +1,3 @@
-import dotenv from 'dotenv';
-dotenv.config();
-
 import AWS from 'aws-sdk';
 import path from 'path';
 import Admin from '../models/Admin.js';
@@ -8,6 +5,14 @@ import Order from '../models/Order.js';
 import Product from '../models/Product.js';
 import User from '../models/User.js';
 import * as notifications from '../notifications.js';
+import { configDotenv } from 'dotenv';
+
+configDotenv();
+
+// Ensure all AWS config is loaded from environment variables only
+if (!process.env.AWS_ACCESS_KEY || !process.env.AWS_SECRET_KEY || !process.env.AWS_REGION || !process.env.AWS_S3_BUCKET) {
+  throw new Error('Missing required AWS environment variables. Please set AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION, and AWS_S3_BUCKET in your .env file.');
+}
 
 const s3 = new AWS.S3({
   accessKeyId: process.env.AWS_ACCESS_KEY,
@@ -113,17 +118,22 @@ export const deleteProduct = async (req, res) => {
 // Add or update review
 export const addOrUpdateReview = async (req, res) => {
   try {
+    console.log('Adding/updating review for product:', req.params.id);
     const { rating, comment } = req.body;
     const userId = req.user.id;
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ message: 'Product not found.' });
     // Remove existing review by this user
+    console.log('Current reviews:', product.reviews);
     product.reviews = product.reviews.filter(r => r.userId.toString() !== userId);
+    console.log(userId, rating, comment);
     // Add new review
     product.reviews.push({ userId, rating, comment, date: new Date() });
+    console.log('Updated reviews:', product.reviews);
     await product.save();
     res.json({ reviews: product.reviews });
   } catch (_err) {
+    console.error('[ADD/UPDATE REVIEW]', _err);
     res.status(500).json({ message: 'Failed to add review.' });
   }
 };
@@ -161,9 +171,11 @@ export const createOrder = async (req, res) => {
     await order.save();
 
     // Notify all admins of new order
+    console.log('[ORDER] Notifying admins of new order:', order._id);
     const admins = await Admin.find({ pushToken: { $exists: true, $ne: null } });
     const user = await User.findById(userId);
     if (admins.length > 0 && user) {
+      console.log(`[ORDER] Found ${admins.length} admins with push tokens. User placing order: ${user.name}`);
       await notifications.notifyAdminsNewOrder(admins, order._id, user.name);
     } else {
       if (admins.length === 0) console.error('[ORDER] No admins with push tokens found!');
@@ -192,7 +204,7 @@ export const getAllOrders = async (req, res) => {
   try {
     // Only log user if present (route is public for now)
     if (req.user && req.user.adminId) {
-      console.log('Fetching all orders for admin:');
+      console.log('Fetching all orders for admin:', req.user.adminId);
     } else {
       console.log('Fetching all orders (no user attached to request)');
     }
@@ -280,9 +292,10 @@ export const getOrderById = async (req, res) => {
 // --- Wishlist ---
 export const getWishlist = async (req, res) => {
   try {
-
+    console.log('Fetching wishlist for user:', req.user.id);
     const user = await import('../models/User.js').then(m => m.default.findById(req.user.id));
     if (!user) return res.status(404).json({ message: 'User not found.' });
+    console.log('User wishlist:', user.wishlist);
     res.json({ wishlist: user.wishlist.map(p => p.toObject ? { ...p.toObject(), id: p._id } : p) });
   } catch (_err) {
     res.status(500).json({ message: 'Failed to fetch wishlist.' });
@@ -332,6 +345,7 @@ export const clearWishlist = async (req, res) => {
 // New endpoint: getWishlistByUserId (fetches user, then fetches products by ID)
 export const getWishlistByUserId = async (req, res) => {
   try {
+    console.log('Fetching wishlist (by user) for:', req.user.id);
     const user = await import('../models/User.js').then(m => m.default.findById(req.user.id));
     if (!user) return res.status(404).json({ message: 'User not found.' });
     if (!user.wishlist || user.wishlist.length === 0) return res.json({ wishlist: [] });
@@ -366,10 +380,10 @@ export const getCart = async (req, res) => {
         qty: item.quantity,
       } : null;
     }).filter(Boolean);
-
+    console.log('Cart items:', cart);
     res.json({ cart });
   } catch (err) {
-
+    console.error('[GET CART IMPROVED]', err);
     res.status(500).json({ message: 'Failed to fetch cart.' });
   }
 };
@@ -446,7 +460,7 @@ export const updateCartItem = async (req, res) => {
     } else {
       user.cart[idx].quantity = parseInt(qty);
     }
-;
+    console.log('User cart after update:', user.cart);
     await user.save();
     // Return updated cart with product details (like getCart)
     if (!user.cart || user.cart.length === 0) return res.json({ cart: [] });
