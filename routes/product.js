@@ -38,13 +38,18 @@ router.post('/wishlist/clear', authenticateUser, productController.clearWishlist
 // Cart
 router.get('/cart/me', authenticateUser, productController.getCart);
 router.post('/cart/add', authenticateUser, productController.addToCart);
-router.post('/cart/remove', authenticateUser, productController.removeFromCart);
+router.delete('/cart/remove', authenticateUser, productController.removeFromCart);
+router.put('/cart/update', authenticateUser, productController.updateCartItem);
 router.post('/cart/clear', authenticateUser, productController.clearCart);
-router.post('/cart/update', authenticateUser, productController.updateCartItem);
 
 // Admin: get all users
 router.get('/users/all', productController.getAllUsers); // admin only in production
 // Admin: get all orders for a user
 router.get('/orders/user/:userId', productController.getOrdersByUserId); // admin only in production
+
+// Test communication services (admin only)
+router.post('/test/communications', productController.testCommunicationServices);
+// Test Brevo email service specifically (admin only)
+router.post('/test/brevo-emails', productController.testBrevoEmailService);
 
 export default router;
