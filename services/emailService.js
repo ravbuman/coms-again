@@ -203,3 +203,103 @@ export const sendOrderConfirmationEmail = async (email, name, order) => {
 
   return await sendEmail(email, subject, htmlContent);
 };
+
+/**
+ * Send password reset OTP email
+ * @param {string} email - User email
+ * @param {string} name - User name
+ * @param {string} otp - OTP code
+ * @returns {Promise<Object>} Send result
+ */
+export const sendPasswordResetOTP = async (email, name, otp) => {
+  const subject = `🔐 Password Reset Code - Indiraa1`;
+  
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Password Reset</title>
+      <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background-color: #f4f4f4; }
+        .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .header { background: linear-gradient(135deg, #dc2626, #991b1b); color: white; padding: 30px; text-align: center; }
+        .header h1 { margin: 0; font-size: 24px; }
+        .content { padding: 40px 30px; }
+        .otp-box { background: #fef2f2; border: 2px solid #dc2626; border-radius: 10px; padding: 20px; text-align: center; margin: 20px 0; }
+        .otp-code { font-size: 36px; font-weight: bold; color: #dc2626; font-family: 'Courier New', monospace; letter-spacing: 4px; }
+        .warning-box { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 15px; margin: 20px 0; }
+        .footer { background: #f8fafc; padding: 20px; text-align: center; color: #6b7280; font-size: 14px; }
+        .security-tips { background: #f0f9ff; border: 1px solid #0ea5e9; border-radius: 8px; padding: 15px; margin: 20px 0; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>🔐 Password Reset Request</h1>
+          <p>Secure your account with us</p>
+        </div>
+        <div class="content">
+          <h2>Hi ${name},</h2>
+          <p>We received a request to reset your password for your Indiraa1 account. If you didn't make this request, please ignore this email.</p>
+          
+          <div class="otp-box">
+            <h3>Your Password Reset Code:</h3>
+            <div class="otp-code">${otp}</div>
+            <p><small>This code is valid for 10 minutes only</small></p>
+          </div>
+          
+          <div class="warning-box">
+            <h4>⚠️ Security Notice:</h4>
+            <ul>
+              <li>This code is for your eyes only - never share it with anyone</li>
+              <li>Our support team will never ask for this code</li>
+              <li>The code expires in 10 minutes for your security</li>
+              <li>If you didn't request this, your account is still secure</li>
+            </ul>
+          </div>
+
+          <div class="security-tips">
+            <h4>🛡️ Security Tips:</h4>
+            <ul>
+              <li>Choose a strong password with letters, numbers, and symbols</li>
+              <li>Don't reuse passwords from other websites</li>
+              <li>Enable two-factor authentication if available</li>
+              <li>Log out from shared devices</li>
+            </ul>
+          </div>
+          
+          <p>If you continue to have problems, please contact our support team.</p>
+        </div>
+        <div class="footer">
+          <p>Stay secure with Indiraa1!</p>
+          <p><small>This is an automated security message. Please do not reply to this email.</small></p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const textContent = `
+    Hi ${name},
+
+    Password Reset Request - Indiraa1
+
+    We received a request to reset your password. If you didn't make this request, please ignore this email.
+
+    Your Password Reset Code: ${otp}
+
+    This code is valid for 10 minutes only.
+
+    Security Notice:
+    - Never share this code with anyone
+    - Our support team will never ask for this code
+    - If you didn't request this, your account is still secure
+
+    Stay secure!
+    Indiraa1 Team
+  `;
+
+  return await sendEmail(email, subject, htmlContent, textContent);
+};

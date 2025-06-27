@@ -6,8 +6,12 @@ const productSchema = new mongoose.Schema({
   price: { type: Number, required: true }, // Base/fallback price
   originalPrice: { type: Number }, // Base original price for discounts
   category: { type: String, required: true },
-  stock: { type: Number, required: true }, // Base/fallback stock
-  images: [String], // S3 URLs - base product images
+  stock: { type: Number, required: true }, // Base/fallback stock  images: [String], // S3 URLs - base product images
+  
+  // Analytics fields
+  viewCount: { type: Number, default: 0 },
+  purchaseCount: { type: Number, default: 0 },
+  featured: { type: Boolean, default: false },
   
   // Variant system
   hasVariants: { type: Boolean, default: false },

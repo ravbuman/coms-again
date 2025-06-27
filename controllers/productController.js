@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import AWS from 'aws-sdk';
+import mongoose from 'mongoose';
 import path from 'path';
 import Admin from '../models/Admin.js';
 import Order from '../models/Order.js';
@@ -19,6 +20,7 @@ import {
   sendStatusUpdateNotification,
   testCommunicationServices as testComm
 } from '../services/communicationService.js';
+import { processOrderRewards } from '../middleware/rewardMiddleware.js';
 import { 
   createDeliveryOTPData, 
   isOrderLocked, 
@@ -171,11 +173,36 @@ export const getAllProducts = async (req, res) => {
   }
 };
 
+// Get featured products
+export const getFeaturedProducts = async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 6;
+    const products = await Product.find({ featured: true })
+      .sort({ createdAt: -1, viewCount: -1, purchaseCount: -1 })
+      .limit(limit);
+    
+    res.json({ 
+      success: true, 
+      products: products.map(addIdField),
+      total: products.length 
+    });
+  } catch (error) {
+    console.error('[GET FEATURED PRODUCTS]', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch featured products.' 
+    });
+  }
+};
+
 // Get product by id
 export const getProductById = async (req, res) => {
   try {
     const product = await Product.findById(req.params.id).populate('reviews.userId', 'name email');
     if (!product) return res.status(404).json({ message: 'Product not found.' });
+    
+    // Increment view count
+    await Product.findByIdAndUpdate(req.params.id, { $inc: { viewCount: 1 } });
     
     // Ensure user names are available in reviews
     const productObj = product.toObject();
@@ -329,7 +356,20 @@ export const getReviews = async (req, res) => {
 // Create order
 export const createOrder = async (req, res) => {
   try {
-    const { items, shipping, totalAmount, paymentMethod, coupon, upiTransactionId, paymentStatus } = req.body;
+    const { 
+      items, 
+      shipping, 
+      subtotal,
+      totalAmount, 
+      paymentMethod, 
+      coupon, 
+      coinDiscount, // New: coin redemption data
+      upiTransactionId, 
+      paymentStatus 
+    } = req.body;
+    
+    console.log('[CREATE ORDER] Received coin discount data:', coinDiscount);
+    
     const userId = req.user.id;
       // Validate required fields
     if (!items || !items.length) {
@@ -340,45 +380,91 @@ export const createOrder = async (req, res) => {
     }
     if (!totalAmount) {
       return res.status(400).json({ message: 'Total amount is required' });
-    }
-
-    // Validate stock availability and prepare stock updates
+    }    // Validate stock availability and prepare stock updates
     const stockUpdates = [];
     for (const item of items) {
-      const product = await Product.findById(item.id);
-      if (!product) {
-        return res.status(400).json({ message: `Product ${item.name} not found` });
-      }
+      if (item.type === 'combo') {
+        // Handle combo pack stock validation
+        const ComboPack = (await import('../models/ComboPack.js')).default;
+        const comboPack = await ComboPack.findById(item.id);
+        if (!comboPack) {
+          return res.status(400).json({ message: `Combo pack ${item.name} not found` });
+        }
 
-      if (item.hasVariant && item.variantId) {
-        // Handle variant stock
-        const variant = product.variants.find(v => v.id === item.variantId);
-        if (!variant) {
-          return res.status(400).json({ message: `Variant not found for ${item.name}` });
-        }
-        if (variant.stock < item.qty) {
+        // Check combo pack stock
+        const availableStock = await comboPack.calculateAvailableStock();
+        if (availableStock < item.qty) {
           return res.status(400).json({ 
-            message: `Insufficient stock for ${item.name} - ${item.variantName}. Available: ${variant.stock}, Required: ${item.qty}` 
+            message: `Insufficient stock for combo pack ${item.name}. Available: ${availableStock}, Required: ${item.qty}` 
           });
         }
+
+        // Track combo pack stock update
         stockUpdates.push({
-          productId: item.id,
-          variantId: item.variantId,
+          id: item.id,
           quantity: item.qty,
-          type: 'variant'
+          type: 'combo',
+          comboPack: comboPack
         });
+
+        // Also track individual product stock updates within the combo
+        for (const comboProduct of comboPack.products) {
+          const product = await Product.findById(comboProduct.productId);
+          if (product) {
+            if (comboProduct.variantId) {
+              stockUpdates.push({
+                productId: comboProduct.productId,
+                variantId: comboProduct.variantId,
+                quantity: comboProduct.quantity * item.qty, // Multiply by combo quantity
+                type: 'variant'
+              });
+            } else {
+              stockUpdates.push({
+                productId: comboProduct.productId,
+                quantity: comboProduct.quantity * item.qty, // Multiply by combo quantity
+                type: 'product'
+              });
+            }
+          }
+        }
+
       } else {
-        // Handle regular product stock
-        if (product.stock < item.qty) {
-          return res.status(400).json({ 
-            message: `Insufficient stock for ${item.name}. Available: ${product.stock}, Required: ${item.qty}` 
+        // Handle regular product stock validation
+        const product = await Product.findById(item.id);
+        if (!product) {
+          return res.status(400).json({ message: `Product ${item.name} not found` });
+        }
+
+        if (item.hasVariant && item.variantId) {
+          // Handle variant stock
+          const variant = product.variants.find(v => v.id === item.variantId);
+          if (!variant) {
+            return res.status(400).json({ message: `Variant not found for ${item.name}` });
+          }
+          if (variant.stock < item.qty) {
+            return res.status(400).json({ 
+              message: `Insufficient stock for ${item.name} - ${item.variantName}. Available: ${variant.stock}, Required: ${item.qty}` 
+            });
+          }
+          stockUpdates.push({
+            productId: item.id,
+            variantId: item.variantId,
+            quantity: item.qty,
+            type: 'variant'
+          });
+        } else {
+          // Handle regular product stock
+          if (product.stock < item.qty) {
+            return res.status(400).json({ 
+              message: `Insufficient stock for ${item.name}. Available: ${product.stock}, Required: ${item.qty}` 
+            });
+          }
+          stockUpdates.push({
+            productId: item.id,
+            quantity: item.qty,
+            type: 'product'
           });
         }
-        stockUpdates.push({
-          productId: item.id,
-          quantity: item.qty,
-          type: 'product'
-        });
       }
     }
 
@@ -393,35 +479,124 @@ export const createOrder = async (req, res) => {
       orderPaymentStatus = 'UnderReview'; // UPI payments need admin verification
     } else if (paymentMethod === 'COD') {
       orderPaymentStatus = 'Pending';
-    }    // Create order with OTP verification
+    }    // Handle coin redemption if provided
+    let coinRedemptionTransaction = null;
+    if (coinDiscount && coinDiscount.coinsUsed > 0) {
+      console.log('[CREATE ORDER] Processing coin redemption:', coinDiscount);
+      
+      try {
+        // Import the redeem coins function
+        const { redeemCoinsForOrder } = await import('./walletController.js');
+        
+        // Create a temporary order ID for the redemption
+        const tempOrderId = new mongoose.Types.ObjectId();
+        
+        // Process the coin redemption
+        const redemptionResult = await redeemCoinsForOrder(
+          userId, 
+          subtotal || totalAmount, 
+          coinDiscount.coinsUsed, 
+          tempOrderId
+        );
+        
+        if (!redemptionResult.success) {
+          return res.status(400).json({
+            success: false,
+            message: `Coin redemption failed: ${redemptionResult.message}`
+          });
+        }
+        
+        coinRedemptionTransaction = redemptionResult.transactionId;
+        console.log('[CREATE ORDER] Coin redemption successful, transaction:', coinRedemptionTransaction);
+        
+      } catch (redemptionError) {
+        console.error('[CREATE ORDER] Coin redemption error:', redemptionError);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to process coin redemption'
+        });
+      }
+    }
+
+    // Calculate discount breakdown
+    const calculatedSubtotal = subtotal || totalAmount;
+    const couponDiscountAmount = 0; // Will be calculated if coupon exists
+    const coinDiscountAmount = coinDiscount ? coinDiscount.discountAmount || 0 : 0;
+    const shippingFee = calculatedSubtotal >= 500 ? 0 : 100; // Free shipping over ₹500
+
+    // Create order with proper breakdown
     const order = new Order({
       userId,
       items,
       shipping,
+      subtotal: calculatedSubtotal,
+      couponDiscount: couponDiscountAmount,
+      coinDiscount: {
+        amount: coinDiscountAmount,
+        coinsUsed: coinDiscount ? coinDiscount.coinsUsed || 0 : 0,
+        transactionId: coinRedemptionTransaction
+      },
+      shippingFee: shippingFee,
       totalAmount,
-      paymentMethod: paymentMethod.toUpperCase(), // Ensure uppercase
+      paymentMethod: paymentMethod.toUpperCase(),
       paymentStatus: orderPaymentStatus,
       coupon: couponObjId,
       upiTransactionId: upiTransactionId || null,
-      deliveryOtp: createDeliveryOTPData() // Generate OTP for delivery verification
+      deliveryOtp: createDeliveryOTPData()
     });
     
     await order.save();
-
-    // Reduce stock after successful order creation
+    
+    // Update the coin redemption transaction with the actual order ID
+    if (coinRedemptionTransaction) {
+      try {
+        const Transaction = (await import('../models/Transaction.js')).default;
+        await Transaction.findByIdAndUpdate(coinRedemptionTransaction, {
+          orderId: order._id,
+          $set: {
+            'metadata.orderId': order._id.toString(),
+            'metadata.orderNumber': order._id.toString().slice(-8).toUpperCase()
+          }
+        });
+        console.log('[CREATE ORDER] Updated transaction with order ID:', order._id);
+      } catch (updateError) {
+        console.error('[CREATE ORDER] Failed to update transaction with order ID:', updateError);
+      }
+    }    // Reduce stock after successful order creation
     for (const update of stockUpdates) {
-      if (update.type === 'variant') {
+      if (update.type === 'combo') {
+        // Reduce combo pack stock
+        const ComboPack = (await import('../models/ComboPack.js')).default;
+        await ComboPack.updateOne(
+          { _id: update.id },
+          { 
+            $inc: { 
+              stock: -update.quantity,
+              purchaseCount: update.quantity // Track purchase count for analytics
+            } 
+          }
+        );      } else if (update.type === 'variant') {
         await Product.updateOne(
           { _id: update.productId, 'variants.id': update.variantId },
           { $inc: { 'variants.$.stock': -update.quantity } }
         );
-      } else {
+        // Increment purchase count for the main product when variant is purchased
         await Product.updateOne(
           { _id: update.productId },
-          { $inc: { stock: -update.quantity } }
+          { $inc: { purchaseCount: update.quantity } }
+        );
+      } else if (update.type === 'product') {
+        await Product.updateOne(
+          { _id: update.productId },
+          { 
+            $inc: { 
+              stock: -update.quantity,
+              purchaseCount: update.quantity // Track purchase count for analytics
+            } 
+          }
         );
       }
-    }    // Notify all admins of new order
+    }// Notify all admins of new order
     try {
       const admins = await Admin.find({ pushToken: { $exists: true, $ne: null } });
       const user = await User.findById(userId);
@@ -656,6 +831,23 @@ export const updateOrderStatus = async (req, res) => {
       // Don't fail status update if notifications fail
     }
 
+    // Process order rewards if status is "Delivered"
+    if (status === 'Delivered') {
+      try {
+        console.log(`[ORDER REWARDS] Starting reward processing for order ${order._id}`);
+        const rewardResult = await processOrderRewards(order);
+        if (rewardResult) {
+          console.log(`[ORDER REWARDS] SUCCESS: Awarded ${rewardResult.coinsAwarded} Indira Coins to user ${order.userId} for order ${order._id}`);
+        } else {
+          console.log(`[ORDER REWARDS] No rewards awarded for order ${order._id} (amount: ₹${order.totalAmount})`);
+        }
+      } catch (rewardError) {
+        console.error('[ORDER REWARDS] FAILED to process rewards:', rewardError);
+        console.error('[ORDER REWARDS] Stack trace:', rewardError.stack);
+        // Don't fail order update if reward processing fails, but log extensively
+      }
+    }
+
     res.json({ 
       order,
       message: status === 'Delivered' ? 'Order delivered successfully!' : 'Order status updated successfully!'
@@ -792,52 +984,69 @@ export const getWishlistByUserId = async (req, res) => {
 };
 
 //   Cart  
-// Improved getCart: fetch user, then fetch product details for all cart items
+// Enhanced getCart: fetch user, then fetch product and combo pack details for all cart items
 export const getCart = async (req, res) => {
   try {
     const User = (await import('../models/User.js')).default;
+    const ComboPack = (await import('../models/ComboPack.js')).default;
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ message: 'User not found.' });
     if (!user.cart || user.cart.length === 0) return res.json({ cart: [] });
     
-    // Get all product IDs in cart
-    const productIds = user.cart.map(item => item.product);
+    const cart = [];
     
-    // Fetch product details for all cart items
-    const products = await Product.find({ _id: { $in: productIds } });
-    
-    // Map cart items to include product details, quantity, and variant info
-    const cart = user.cart.map(item => {
-      const prod = products.find(p => p._id.toString() === item.product.toString());
-      if (!prod) return null;
-      
-      const cartItem = {
-        ...prod.toObject(),
-        id: prod._id,
-        qty: item.quantity,
-        addedAt: item.addedAt
-      };
-      
-      // Add variant information if present
-      if (item.variantId && prod.hasVariants) {
-        const variant = getVariantById(prod, item.variantId);
-        if (variant) {
-          cartItem.selectedVariant = {
-            id: item.variantId,
-            name: item.variantName || variant.name,
-            label: variant.label,
-            price: item.variantPrice || variant.price,
-            originalPrice: variant.originalPrice,
-            stock: variant.stock,
-            images: variant.images
-          };
-          // Override main product price with variant price for cart calculations
-          cartItem.price = item.variantPrice || variant.price;
+    // Process each cart item
+    for (const item of user.cart) {
+      if (item.type === 'product') {
+        // Handle product items
+        const product = await Product.findById(item.product);
+        if (!product) continue; // Skip if product not found
+        
+        const cartItem = {
+          ...product.toObject(),
+          id: product._id,
+          type: 'product',
+          qty: item.quantity,
+          addedAt: item.addedAt
+        };
+        
+        // Add variant information if present
+        if (item.variantId && product.hasVariants) {
+          const variant = getVariantById(product, item.variantId);
+          if (variant) {
+            cartItem.selectedVariant = {
+              id: item.variantId,
+              name: item.variantName || variant.name,
+              label: variant.label,
+              price: item.variantPrice || variant.price,
+              originalPrice: variant.originalPrice,
+              stock: variant.stock,
+              images: variant.images
+            };
+            // Override main product price with variant price for cart calculations
+            cartItem.price = item.variantPrice || variant.price;
+          }
         }
+        
+        cart.push(cartItem);
+        
+      } else if (item.type === 'combo') {
+        // Handle combo pack items
+        const comboPack = await ComboPack.findById(item.comboPackId).populate('products.productId', 'name images');
+        if (!comboPack) continue; // Skip if combo pack not found
+        
+        const cartItem = {
+          ...comboPack.toObject(),
+          id: comboPack._id,
+          type: 'combo',
+          qty: item.quantity,
+          addedAt: item.addedAt,
+          price: comboPack.comboPrice // Use combo price for calculations
+        };
+        
+        cart.push(cartItem);
       }
-      
-      return cartItem;
-    }).filter(Boolean);
+    }
 
     res.json({ cart });
   } catch (err) {
@@ -890,10 +1099,10 @@ export const addToCart = async (req, res) => {
         return res.status(400).json({ message: `Only ${stockToCheck} items available.` });
       }
     }
-    
-    // Check if item with same variant already exists in cart
+      // Check if item with same variant already exists in cart
     const cartKey = variantInfo ? `${productId}-${variantInfo.id}` : productId;
     const idx = user.cart.findIndex(item => {
+      if (item.type !== 'product') return false; // Only match product items
       if (variantInfo) {
         return item.product.toString() === productId && item.variantId === variantInfo.id;
       }
@@ -909,6 +1118,7 @@ export const addToCart = async (req, res) => {
     } else {
       // Add new cart item
       const cartItem = {
+        type: 'product',
         product: productId,
         quantity: quantity
       };
@@ -932,21 +1142,32 @@ export const addToCart = async (req, res) => {
 
 export const removeFromCart = async (req, res) => {
   try {
-    const { productId, variantId } = req.body;
+    const { productId, variantId, comboPackId, type } = req.body;
     const User = (await import('../models/User.js')).default;
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ message: 'User not found.' });
     
-    // Remove specific variant or all variants of product
-    user.cart = user.cart.filter(item => {
-      if (variantId) {
-        // Remove specific variant
-        return !(item.product.toString() === productId && item.variantId === variantId);
-      } else {
-        // Remove all variants of this product
-        return item.product.toString() !== productId;
-      }
-    });
+    if (type === 'combo' && comboPackId) {
+      // Remove combo pack from cart
+      user.cart = user.cart.filter(item => 
+        !(item.type === 'combo' && item.comboPackId.toString() === comboPackId)
+      );
+    } else if (productId) {
+      // Remove product from cart (with optional variant)
+      user.cart = user.cart.filter(item => {
+        if (item.type !== 'product') return true; // Keep non-product items
+        
+        if (variantId) {
+          // Remove specific variant
+          return !(item.product.toString() === productId && item.variantId === variantId);
+        } else {
+          // Remove all variants of this product
+          return item.product.toString() !== productId;
+        }
+      });
+    } else {
+      return res.status(400).json({ message: 'Invalid request parameters.' });
+    }
     
     await user.save();
     res.json({ cart: user.cart, message: 'Removed from cart successfully' });
@@ -981,11 +1202,10 @@ export const clearCart = async (req, res) => {
 export const updateCartItem = async (req, res) => {
   try {
     console.log('Updating cart item for user:', req.user.id);
-    console.log('Request body:', req.body);
-    const { productId, qty, variantId } = req.body;
-    if (!productId || !qty) {
-      console.error('Invalid request body:', req.body);
-      return res.status(400).json({ message: 'Invalid productId or quantity.' });
+    console.log('Request body:', req.body);    const { productId, qty, variantId, comboPackId, type } = req.body;
+    if (!qty || qty < 1) {
+      console.error('Invalid quantity:', qty);
+      return res.status(400).json({ message: 'Invalid quantity.' });
     }
     
     const User = (await import('../models/User.js')).default;
@@ -994,41 +1214,63 @@ export const updateCartItem = async (req, res) => {
       console.error('User not found:', req.user.id);
       return res.status(404).json({ message: 'User not found.' });
     }
+      console.log('User cart before update:', user.cart);
     
-    console.log('User cart before update:', user.cart);
+    let idx = -1;
     
-    // Find cart item by product and variant
-    const idx = user.cart.findIndex(item => {
-      if (variantId) {
-        return item.product.toString() === productId && item.variantId === variantId;
-      }
-      return item.product.toString() === productId && !item.variantId;
-    });
-    
-    if (idx === -1) {
-      return res.status(404).json({ message: 'Product variant not found in cart.' });
-    }
-    
-    // Validate stock for the quantity update
-    const product = await Product.findById(productId);
-    if (product) {
-      let stockToCheck = product.stock;
-      if (product.hasVariants && variantId) {
-        const variant = getVariantById(product, variantId);
-        stockToCheck = variant ? variant.stock : 0;
+    if (type === 'combo' && comboPackId) {
+      // Find combo pack item
+      idx = user.cart.findIndex(item => 
+        item.type === 'combo' && item.comboPackId.toString() === comboPackId
+      );
+      
+      if (idx === -1) {
+        return res.status(404).json({ message: 'Combo pack not found in cart.' });
       }
       
-      if (qty > stockToCheck) {
-        return res.status(400).json({ message: `Only ${stockToCheck} items available.` });
+      // Validate combo pack stock
+      const ComboPack = (await import('../models/ComboPack.js')).default;
+      const comboPack = await ComboPack.findById(comboPackId);
+      if (comboPack) {
+        const availableStock = await comboPack.calculateAvailableStock();
+        if (qty > availableStock) {
+          return res.status(400).json({ message: `Only ${availableStock} combo packs available.` });
+        }
       }
+      
+    } else if (productId) {
+      // Find product item by product and variant
+      idx = user.cart.findIndex(item => {
+        if (item.type !== 'product') return false;
+        if (variantId) {
+          return item.product.toString() === productId && item.variantId === variantId;
+        }
+        return item.product.toString() === productId && !item.variantId;
+      });
+      
+      if (idx === -1) {
+        return res.status(404).json({ message: 'Product not found in cart.' });
+      }
+      
+      // Validate product stock
+      const product = await Product.findById(productId);
+      if (product) {
+        let stockToCheck = product.stock;
+        if (product.hasVariants && variantId) {
+          const variant = getVariantById(product, variantId);
+          stockToCheck = variant ? variant.stock : 0;
+        }
+        
+        if (qty > stockToCheck) {
+          return res.status(400).json({ message: `Only ${stockToCheck} items available.` });
+        }
+      }
+    } else {
+      return res.status(400).json({ message: 'Invalid request parameters.' });
     }
     
-    if (qty < 1) {
-      // Remove item if quantity is less than 1
-      user.cart.splice(idx, 1);
-    } else {
-      user.cart[idx].quantity = parseInt(qty);
-    }
+    // Update quantity
+    user.cart[idx].quantity = parseInt(qty);
     
     await user.save();
     
@@ -1130,184 +1372,211 @@ export const getOrdersByUserId = async (req, res) => {
   }
 };
 
-// Update order (for UPI UTR submission or admin payment status update)
-export const updateOrder = async (req, res) => {
+// Toggle product featured status (admin)
+export const toggleProductFeatured = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { upiTransactionId, paymentStatus, paymentMethod } = req.body;
-    const order = await Order.findById(id);
-    if (!order) return res.status(404).json({ message: 'Order not found.' });
-    if (upiTransactionId !== undefined) order.upiTransactionId = upiTransactionId;
-    if (paymentStatus !== undefined) order.paymentStatus = paymentStatus;
-    if (paymentMethod !== undefined) order.paymentMethod = paymentMethod;
+    const productId = req.params.id;
+    const product = await Product.findById(productId);
+    
+    if (!product) {
+      return res.status(404).json({ message: 'Product not found.' });
+    }
+    
+    // Toggle featured status
+    product.featured = !product.featured;
+    await product.save();
+    
+    res.json({ 
+      success: true, 
+      product: addIdField(product),
+      message: `Product ${product.featured ? 'marked as featured' : 'removed from featured'}.`
+    });
+  } catch (error) {
+    console.error('[TOGGLE PRODUCT FEATURED]', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to toggle product featured status.' 
+    });
+  }
+};
+
+// ======================
+// DELIVERY SLOT MANAGEMENT
+// ======================
+
+// Time slots configuration
+const TIME_SLOTS = [
+  { id: 'morning', label: '9:00 AM - 12:00 PM', value: '9:00 AM - 12:00 PM' },
+  { id: 'afternoon', label: '12:00 PM - 3:00 PM', value: '12:00 PM - 3:00 PM' },
+  { id: 'evening', label: '3:00 PM - 6:00 PM', value: '3:00 PM - 6:00 PM' },
+  { id: 'night', label: '6:00 PM - 9:00 PM', value: '6:00 PM - 9:00 PM' }
+];
+
+// Get available time slots
+export const getTimeSlots = async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      timeSlots: TIME_SLOTS
+    });
+  } catch (error) {
+    console.error('[GET TIME SLOTS]', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch time slots.'
+    });
+  }
+};
+
+// Get available delivery dates (starting 2 days from today)
+export const getAvailableDeliveryDates = async (req, res) => {
+  try {
+    const dates = [];
+    const today = new Date();
+    
+    // Generate dates starting from 2 days ahead, for next 30 days
+    for (let i = 2; i <= 32; i++) {
+      const date = new Date(today);
+      date.setDate(today.getDate() + i);
+      dates.push({
+        date: date.toISOString().split('T')[0], // YYYY-MM-DD format
+        label: date.toLocaleDateString('en-IN', { 
+          weekday: 'long', 
+          year: 'numeric', 
+          month: 'long', 
+          day: 'numeric' 
+        })
+      });
+    }
+    
+    res.json({
+      success: true,
+      availableDates: dates
+    });
+  } catch (error) {
+    console.error('[GET AVAILABLE DELIVERY DATES]', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch available delivery dates.'
+    });
+  }
+};
+
+// Update delivery slot for an order
+export const updateDeliverySlot = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { date, timeSlot } = req.body;
+    
+    // Find the order
+    const order = await Order.findById(orderId);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found.'
+      });
+    }
+    
+    // Check if user owns the order (for user requests)
+    if (req.user.role !== 'admin' && order.userId.toString() !== req.user.id) {
+      return res.status(403).json({
+        success: false,
+        message: 'Unauthorized to modify this order.'
+      });
+    }
+    
+    // Check if delivery slot can be modified
+    if (!order.canModifyDeliverySlot()) {
+      return res.status(400).json({
+        success: false,
+        message: `Delivery slot cannot be modified. Order status: ${order.status}`
+      });
+    }
+    
+    // Validate date (must be at least 2 days from today)
+    if (date) {
+      const selectedDate = new Date(date);
+      const minDate = new Date();
+      minDate.setDate(minDate.getDate() + 2);
+      minDate.setHours(0, 0, 0, 0);
+      
+      if (selectedDate < minDate) {
+        return res.status(400).json({
+          success: false,
+          message: 'Delivery date must be at least 2 days from today.'
+        });
+      }
+    }
+    
+    // Validate time slot
+    if (timeSlot && !TIME_SLOTS.some(slot => slot.value === timeSlot)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid time slot selected.'
+      });
+    }
+    
+    // Update delivery slot
+    if (date) order.deliverySlot.date = new Date(date);
+    if (timeSlot) order.deliverySlot.timeSlot = timeSlot;
+    order.deliverySlot.lastModified = new Date();
+    
     await order.save();
-    res.json({ success: true, order });
-  } catch (_err) {
-    res.status(500).json({ message: 'Failed to update order.' });
-  }
-};
-
-// Test communication services (admin only)
-export const testCommunicationServices = async (req, res) => {
-  try {
-    const { testEmail, testPhone, testName = 'Test User' } = req.body;
-
-    if (!testEmail && !testPhone) {
-      return res.status(400).json({ 
-        message: 'Please provide at least testEmail or testPhone for testing.' 
-      });
-    }
-
-    console.log('[TEST] Testing communication services with:', { testEmail, testPhone, testName });
-
-    // Test OTP notification
-    const testOTP = '123456';
-    const testOrderId = 'TEST-' + Date.now();
-    
-    const otpResult = await sendOTPNotification(
-      { name: testName, email: testEmail, phone: testPhone },
-      testOTP,
-      testOrderId
-    );
-
-    // Test order confirmation (create a mock order)
-    const mockOrder = {
-      _id: testOrderId,
-      totalAmount: 999.99,
-      items: [{ name: 'Test Product', qty: 1, price: 999.99 }],
-      shipping: { address: 'Test Address' }
-    };
-
-    const confirmResult = await sendOrderConfirmationNotification(
-      { name: testName, email: testEmail, phone: testPhone },
-      mockOrder
-    );
-
-    // Test status update
-    const statusResult = await sendStatusUpdateNotification(
-      { name: testName, email: testEmail, phone: testPhone },
-      testOrderId,
-      'Shipped'
-    );
-
-    res.json({
-      success: true,
-      message: 'Communication services test completed',
-      results: {
-        otp: otpResult,
-        orderConfirmation: confirmResult,
-        statusUpdate: statusResult
-      },
-      summary: {
-        otp: otpResult.summary,
-        orderConfirmation: confirmResult.summary,
-        statusUpdate: statusResult.summary
-      }
-    });
-
-  } catch (error) {
-    console.error('[TEST] Communication services test error:', error);
-    res.status(500).json({ 
-      success: false,
-      message: 'Failed to test communication services', 
-      error: error.message 
-    });
-  }
-};
-
-// Test Brevo email service specifically (admin only)
-export const testBrevoEmailService = async (req, res) => {
-  try {
-    const { testEmail, testName = 'Test User' } = req.body;
-
-    if (!testEmail) {
-      return res.status(400).json({ 
-        message: 'Please provide testEmail for testing.' 
-      });
-    }
-
-    console.log('[TEST] Testing Brevo email service with:', { testEmail, testName });
-
-    const results = {
-      orderPlaced: null,
-      orderOtp: null,
-      orderDelivered: null
-    };
-
-    // Create mock order for testing
-    const mockOrder = {
-      _id: 'TEST-BREVO-' + Date.now(),
-      totalAmount: 1299.99,
-      items: [
-        { name: 'Test Product 1', qty: 2, price: 599.99 },
-        { name: 'Test Product 2', qty: 1, price: 100.01 }
-      ],
-      shipping: { 
-        name: testName,
-        address: 'Test Address, Test City, Test State 123456',
-        phone: '+91 9876543210'
-      },
-      paymentMethod: 'UPI',
-      paymentStatus: 'Paid',
-      placedAt: new Date(),
-      createdAt: new Date()
-    };
-
-    // Test 1: Order Placed Email
-    try {
-      const orderPlacedResult = await sendOrderPlacedEmail(testEmail, testName, mockOrder);
-      results.orderPlaced = { success: true, ...orderPlacedResult };
-      console.log('[TEST] Order placed email sent successfully');
-    } catch (error) {
-      results.orderPlaced = { success: false, error: error.message };
-      console.error('[TEST] Order placed email failed:', error);
-    }
-
-    // Test 2: Order OTP Email
-    try {
-      const testOTP = '123456';
-      const otpResult = await sendOrderOtpEmail(testEmail, testName, testOTP, mockOrder._id);
-      results.orderOtp = { success: true, ...otpResult };
-      console.log('[TEST] Order OTP email sent successfully');
-    } catch (error) {
-      results.orderOtp = { success: false, error: error.message };
-      console.error('[TEST] Order OTP email failed:', error);
-    }
-
-    // Test 3: Order Delivered Email
-    try {
-      const deliveredResult = await sendOrderDeliveredEmail(testEmail, testName, mockOrder._id);
-      results.orderDelivered = { success: true, ...deliveredResult };
-      console.log('[TEST] Order delivered email sent successfully');
-    } catch (error) {
-      results.orderDelivered = { success: false, error: error.message };
-      console.error('[TEST] Order delivered email failed:', error);
-    }
-
-    const successCount = Object.values(results).filter(r => r.success).length;
     
     res.json({
       success: true,
-      message: `Brevo email service test completed: ${successCount}/3 emails sent successfully`,
-      results,
-      summary: {
-        total: 3,
-        successful: successCount,
-        failed: 3 - successCount
-      },
-      mockOrder: {
-        id: mockOrder._id,
-        testEmail,
-        testName
+      message: 'Delivery slot updated successfully.',
+      deliverySlot: {
+        date: order.deliverySlot.date,
+        timeSlot: order.deliverySlot.timeSlot,
+        lastModified: order.deliverySlot.lastModified
       }
     });
-
   } catch (error) {
-    console.error('[TEST] Brevo email service test error:', error);
-    res.status(500).json({ 
+    console.error('[UPDATE DELIVERY SLOT]', error);
+    res.status(500).json({
       success: false,
-      message: 'Failed to test Brevo email service', 
-      error: error.message 
+      message: 'Failed to update delivery slot.'
+    });
+  }
+};8
+
+// Get delivery slot for an order
+export const getDeliverySlot = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    
+    const order = await Order.findById(orderId);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found.'
+      });
+    }
+    
+    // Check if user owns the order (for user requests)
+    if (req.user.role !== 'admin' && order.userId.toString() !== req.user.id) {
+      return res.status(403).json({
+        success: false,
+        message: 'Unauthorized to view this order.'
+      });
+    }
+    
+    res.json({
+      success: true,
+      deliverySlot: {
+        date: order.deliverySlot.date,
+        timeSlot: order.deliverySlot.timeSlot,
+        isModifiable: order.deliverySlot.isModifiable,
+        lastModified: order.deliverySlot.lastModified
+      },
+      canModify: order.canModifyDeliverySlot()
+    });
+  } catch (error) {
+    console.error('[GET DELIVERY SLOT]', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch delivery slot.'
     });
   }
 };

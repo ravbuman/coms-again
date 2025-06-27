@@ -5,14 +5,30 @@ import { addUserAddress } from '../controllers/productController.js';
 import { authenticateUser } from '../middleware/auth.js';
 import Admin from '../models/Admin.js';
 import User from '../models/User.js';
+import { processReferralRegistration } from '../controllers/referralController.js';
+import { sendPasswordResetOTP } from '../services/emailService.js';
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'RaviBuraga';
 
+// In-memory store for password reset OTPs (in production, use Redis or database)
+const passwordResetOTPs = new Map();
+
+// Clean expired OTPs every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, data] of passwordResetOTPs.entries()) {
+    if (now > data.expiresAt) {
+      passwordResetOTPs.delete(key);
+      console.log(`[FORGOT_PASSWORD] Cleaned expired OTP for: ${key}`);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // Register
 router.post('/register', async (req, res) => {
   try {
-    const { username, password, name, email, phone } = req.body;
+    const { username, password, name, email, phone, referralCode } = req.body;
     
     if (!username || !password || !name || !email || !phone) {
       return res.status(400).json({ message: 'All fields are required.' });
@@ -49,6 +65,31 @@ router.post('/register', async (req, res) => {
       email: email.toLowerCase(), 
       phone 
     });
+
+    // Generate referral code for new user
+    user.generateReferralCode();
+    await user.save();
+    
+    // Process referral bonus if referral code was provided
+    let referralResult = null;
+    if (referralCode && referralCode.trim()) {
+      try {
+        console.log(`[REGISTER] Starting referral processing for user ${user._id} with code: "${referralCode.trim()}"`);
+        referralResult = await processReferralRegistration(user._id, referralCode.trim());
+        console.log(`[REGISTER] Referral processing completed successfully:`, referralResult);
+      } catch (referralError) {
+        console.error('[REGISTER] Referral processing failed:', referralError);
+        console.error('[REGISTER] Referral error stack:', referralError.stack);
+        // Don't fail registration if referral processing fails
+        referralResult = { 
+          success: false, 
+          error: referralError.message,
+          message: 'Registration completed but referral bonus failed' 
+        };
+      }
+    } else {
+      console.log('[REGISTER] No referral code provided');
+    }
     
     const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '10d' });
 
@@ -60,8 +101,11 @@ router.post('/register', async (req, res) => {
         name: user.name, 
         email: user.email, 
         phone: user.phone, 
-        addresses: user.addresses 
-      } 
+        addresses: user.addresses,
+        wallet: user.wallet,
+        referralCode: user.referralCode
+      },
+      referralResult // Include referral processing result if applicable
     });
   } catch (err) {
     console.error('[REGISTER] Error:', err);
@@ -205,5 +249,236 @@ router.put('/me', async (req, res) => {
 
 // Add user address (protected)
 router.post('/address/add', authenticateUser, addUserAddress);
+
+// Forgot Password - Step 1: Request OTP
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const { identifier } = req.body; // Can be email or username
+    
+    if (!identifier || !identifier.trim()) {
+      return res.status(400).json({ message: 'Email or username is required.' });
+    }
+
+    console.log(`[FORGOT_PASSWORD] Password reset requested for: ${identifier}`);
+
+    // Find user by email or username
+    const user = await User.findOne({
+      $or: [
+        { email: identifier.toLowerCase().trim() },
+        { username: identifier.trim() }
+      ]
+    });
+
+    if (!user) {
+      console.log(`[FORGOT_PASSWORD] User not found: ${identifier}`);
+      // Don't reveal if user exists or not for security
+      return res.json({ 
+        message: 'If this email or username exists, you will receive an OTP shortly.',
+        step: 'otp_sent'
+      });
+    }
+
+    console.log(`[FORGOT_PASSWORD] User found: ${user.email} (${user.username})`);
+
+    // Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + (10 * 60 * 1000); // 10 minutes
+
+    // Generate a session token for this password reset session
+    const sessionToken = jwt.sign(
+      { 
+        email: user.email.toLowerCase(),
+        purpose: 'password_reset_session',
+        timestamp: Date.now()
+      }, 
+      JWT_SECRET, 
+      { expiresIn: '15m' }
+    );
+
+    // Store OTP in memory using session token as key (use Redis in production)
+    passwordResetOTPs.set(sessionToken, {
+      otp,
+      userId: user._id.toString(),
+      email: user.email.toLowerCase(),
+      expiresAt,
+      attempts: 0,
+      maxAttempts: 5
+    });
+
+    console.log(`[FORGOT_PASSWORD] Generated OTP for ${user.email}: ${otp} (expires at ${new Date(expiresAt).toISOString()})`);
+    console.log(`[FORGOT_PASSWORD] Session token created: ${sessionToken}`);
+
+    // Send OTP via email
+    try {
+      const emailResult = await sendPasswordResetOTP(user.email, user.name, otp);
+      
+      if (emailResult.success) {
+        console.log(`[FORGOT_PASSWORD] OTP email sent successfully to: ${user.email}`);
+        res.json({ 
+          message: 'Password reset code sent to your email address.',
+          step: 'otp_sent',
+          sessionToken: sessionToken,
+          maskedEmail: user.email.replace(/(.{2}).*(@.*)/, '$1***$2') // Just for display
+        });
+      } else {
+        console.error(`[FORGOT_PASSWORD] Failed to send OTP email:`, emailResult.error);
+        passwordResetOTPs.delete(sessionToken); // Clean up on email failure
+        res.status(500).json({ message: 'Failed to send reset code. Please try again.' });
+      }
+    } catch (emailError) {
+      console.error(`[FORGOT_PASSWORD] Email sending error:`, emailError);
+      passwordResetOTPs.delete(sessionToken);
+      res.status(500).json({ message: 'Failed to send reset code. Please try again.' });
+    }
+
+  } catch (error) {
+    console.error('[FORGOT_PASSWORD] Error in forgot password:', error);
+    res.status(500).json({ message: 'Server error. Please try again.' });
+  }
+});
+
+// Forgot Password - Step 2: Verify OTP
+router.post('/verify-reset-otp', async (req, res) => {
+  try {
+    const { sessionToken, otp } = req.body;
+    
+    if (!sessionToken || !otp) {
+      return res.status(400).json({ message: 'Session token and OTP are required.' });
+    }
+
+    console.log(`[VERIFY_OTP] OTP verification attempt with session token`);
+
+    // Verify session token
+    let sessionData;
+    try {
+      sessionData = jwt.verify(sessionToken, JWT_SECRET);
+      if (sessionData.purpose !== 'password_reset_session') {
+        throw new Error('Invalid session token purpose');
+      }
+    } catch (jwtError) {
+      console.log(`[VERIFY_OTP] Invalid session token:`, jwtError.message);
+      return res.status(400).json({ message: 'Invalid or expired session. Please start over.' });
+    }
+
+    const storedData = passwordResetOTPs.get(sessionToken);
+
+    if (!storedData) {
+      console.log(`[VERIFY_OTP] No OTP found for session token`);
+      return res.status(400).json({ message: 'Invalid or expired OTP. Please request a new one.' });
+    }
+
+    console.log(`[VERIFY_OTP] Found OTP data for email: ${storedData.email}`);
+
+    // Check if OTP is expired
+    if (Date.now() > storedData.expiresAt) {
+      console.log(`[VERIFY_OTP] Expired OTP for: ${storedData.email}`);
+      passwordResetOTPs.delete(sessionToken);
+      return res.status(400).json({ message: 'OTP has expired. Please request a new one.' });
+    }
+
+    // Check attempt limit
+    if (storedData.attempts >= storedData.maxAttempts) {
+      console.log(`[VERIFY_OTP] Max attempts exceeded for: ${storedData.email}`);
+      passwordResetOTPs.delete(sessionToken);
+      return res.status(400).json({ message: 'Too many failed attempts. Please request a new OTP.' });
+    }
+
+    // Verify OTP
+    if (storedData.otp !== otp.toString()) {
+      storedData.attempts += 1;
+      console.log(`[VERIFY_OTP] Invalid OTP for ${storedData.email}. Attempt ${storedData.attempts}/${storedData.maxAttempts}`);
+      return res.status(400).json({ 
+        message: `Invalid OTP. ${storedData.maxAttempts - storedData.attempts} attempts remaining.` 
+      });
+    }
+
+    console.log(`[VERIFY_OTP] OTP verified successfully for: ${storedData.email}`);
+
+    // Generate temporary reset token (valid for 15 minutes)
+    const resetToken = jwt.sign(
+      { 
+        userId: storedData.userId, 
+        email: storedData.email,
+        purpose: 'password_reset'
+      }, 
+      JWT_SECRET, 
+      { expiresIn: '15m' }
+    );
+
+    // Clean up OTP
+    passwordResetOTPs.delete(sessionToken);
+
+    res.json({ 
+      message: 'OTP verified successfully. You can now reset your password.',
+      step: 'reset_password',
+      resetToken
+    });
+
+  } catch (error) {
+    console.error('[VERIFY_OTP] Error:', error);
+    res.status(500).json({ message: 'Server error. Please try again.' });
+  }
+});
+
+// Forgot Password - Step 3: Reset Password
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { resetToken, newPassword, confirmPassword } = req.body;
+    
+    if (!resetToken || !newPassword || !confirmPassword) {
+      return res.status(400).json({ message: 'All fields are required.' });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ message: 'Passwords do not match.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters long.' });
+    }
+
+    console.log(`[RESET_PASSWORD] Password reset attempt with token`);
+
+    // Verify reset token
+    let decoded;
+    try {
+      decoded = jwt.verify(resetToken, JWT_SECRET);
+      
+      if (decoded.purpose !== 'password_reset') {
+        throw new Error('Invalid token purpose');
+      }
+    } catch (jwtError) {
+      console.log(`[RESET_PASSWORD] Invalid or expired reset token:`, jwtError.message);
+      return res.status(400).json({ message: 'Invalid or expired reset token. Please start the process again.' });
+    }
+
+    // Find user
+    const user = await User.findById(decoded.userId);
+    if (!user) {
+      console.log(`[RESET_PASSWORD] User not found for ID: ${decoded.userId}`);
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    console.log(`[RESET_PASSWORD] Resetting password for user: ${user.email}`);
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    
+    // Update user password
+    user.password = hashedPassword;
+    await user.save();
+
+    console.log(`[RESET_PASSWORD] Password updated successfully for: ${user.email}`);
+
+    res.json({ 
+      message: 'Password reset successfully. You can now login with your new password.',
+      step: 'completed'
+    });
+
+  } catch (error) {
+    console.error('[RESET_PASSWORD] Error:', error);
+    res.status(500).json({ message: 'Server error. Please try again.' });
+  }
+});
 
 export default router;

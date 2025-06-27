@@ -5,7 +5,22 @@ import cors from 'cors';
 import express from 'express';
 import mongoose from 'mongoose';
 import cron from 'node-cron';
-import { updateOrder } from './controllers/productController.js';
+import { 
+  updateOrderStatus,
+  getTimeSlots,
+  getAvailableDeliveryDates,
+  updateDeliverySlot,
+  getDeliverySlot
+} from './controllers/productController.js';
+import { 
+  getReferralCode,
+  validateReferralCode,
+  trackReferralVisit,
+  updateVisitDuration,
+  getReferralStats,
+  getReferralLeaderboard
+} from './controllers/referralController.js';
+import { validateRewardRequest } from './middleware/rewardMiddleware.js';
 import { authenticateUser } from './middleware/auth.js';
 import Admin from './models/Admin.js';
 import User from './models/User.js';
@@ -13,6 +28,9 @@ import * as notifications from './notifications.js';
 import authRoutes from './routes/auth.js';
 import couponRoutes from './routes/coupon.js';
 import productRoutes from './routes/product.js';
+import comboPackRoutes from './routes/comboPack.js';
+import bannerRoutes from './routes/banner.js';
+import walletRoutes from './routes/wallet.js';
 
 const app = express();
 
@@ -23,6 +41,9 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/coupons', couponRoutes);
+app.use('/api/combo-packs', comboPackRoutes);
+app.use('/api/banners', bannerRoutes);
+app.use('/api/wallet', walletRoutes);
 
 // Add endpoint to receive and store user push tokens
 app.post('/api/users/push-token', authenticateUser, async (req, res) => {
@@ -55,7 +76,162 @@ app.post('/api/admins/push-token', authenticateUser, async (req, res) => {
 });
 
 // Update order (for UPI UTR or admin payment status)
-app.put('/api/orders/:id', authenticateUser, updateOrder);
+app.put('/api/orders/:id', authenticateUser, updateOrderStatus);
+
+// Delivery Slot Management Routes
+app.get('/api/delivery-slots/time-slots', getTimeSlots);
+app.get('/api/delivery-slots/available-dates', getAvailableDeliveryDates);
+app.put('/api/orders/:orderId/delivery-slot', authenticateUser, updateDeliverySlot);
+app.get('/api/orders/:orderId/delivery-slot', authenticateUser, getDeliverySlot);
+
+// Referral Management Routes
+app.get('/api/referral/code', authenticateUser, getReferralCode);
+app.post('/api/referral/validate', validateReferralCode);
+app.post('/api/referral/visit', trackReferralVisit);
+app.put('/api/referral/visit', updateVisitDuration);
+app.get('/api/referral/stats', authenticateUser, getReferralStats);
+app.get('/api/referral/leaderboard', getReferralLeaderboard);
+
+// Test endpoint for reward system debugging
+app.post('/api/test/rewards', authenticateUser, async (req, res) => {
+  try {
+    const { orderId, action } = req.body;
+    
+    if (action === 'test-order-reward') {
+      const { processOrderRewards } = await import('./middleware/rewardMiddleware.js');
+      const Order = (await import('./models/Order.js')).default;
+      
+      if (!orderId) {
+        return res.status(400).json({ success: false, message: 'Order ID required' });
+      }
+      
+      const order = await Order.findById(orderId);
+      if (!order) {
+        return res.status(404).json({ success: false, message: 'Order not found' });
+      }
+      
+      // Only allow testing user's own orders or admin
+      if (req.user.role !== 'admin' && order.userId.toString() !== req.user.id) {
+        return res.status(403).json({ success: false, message: 'Unauthorized' });
+      }
+      
+      console.log(`[TEST] Testing order rewards for order ${orderId}`);
+      const result = await processOrderRewards(order);
+      
+      res.json({ 
+        success: true, 
+        message: 'Order reward test completed',
+        result,
+        orderStatus: order.status,
+        orderAmount: order.totalAmount
+      });
+      
+    } else if (action === 'test-referral-registration') {
+      const { processReferralRegistration } = await import('./controllers/referralController.js');
+      const { referralCode } = req.body;
+      
+      if (!referralCode) {
+        return res.status(400).json({ success: false, message: 'Referral code required' });
+      }
+      
+      console.log(`[TEST] Testing referral registration for user ${req.user.id} with code ${referralCode}`);
+      const result = await processReferralRegistration(req.user.id, referralCode);
+      
+      res.json({ 
+        success: true, 
+        message: 'Referral registration test completed',
+        result
+      });
+      
+    } else if (action === 'check-wallet') {
+      const User = (await import('./models/User.js')).default;
+      const Transaction = (await import('./models/Transaction.js')).default;
+      
+      const user = await User.findById(req.user.id).select('wallet name');
+      const transactions = await Transaction.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(10);
+      
+      res.json({
+        success: true,
+        message: 'Wallet status retrieved',
+        wallet: user.wallet,
+        userName: user.name,
+        recentTransactions: transactions
+      });
+      
+    } else {
+      res.status(400).json({ success: false, message: 'Invalid test action' });
+    }
+    
+  } catch (error) {
+    console.error('[TEST REWARDS] Error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Test failed', 
+      error: error.message 
+    });
+  }
+});
+
+// Test endpoint for manual referral testing
+app.post('/api/test/referral-registration', async (req, res) => {
+  try {
+    const { referredUserId, referralCode } = req.body;
+    
+    if (!referredUserId || !referralCode) {
+      return res.status(400).json({
+        success: false,
+        message: 'referredUserId and referralCode are required'
+      });
+    }
+    
+    const { processReferralRegistration } = await import('./controllers/referralController.js');
+    const result = await processReferralRegistration(referredUserId, referralCode);
+    
+    res.json({
+      success: true,
+      message: 'Test referral registration completed',
+      result
+    });
+    
+  } catch (error) {
+    console.error('[TEST REFERRAL REGISTRATION]', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+// Test endpoint for visit reward processing
+app.post('/api/test/visit-rewards', async (req, res) => {
+  try {
+    const { referrerId } = req.body;
+    
+    if (!referrerId) {
+      return res.status(400).json({
+        success: false,
+        message: 'referrerId is required'
+      });
+    }
+    
+    const ReferralVisit = (await import('./models/ReferralVisit.js')).default;
+    const eligibleVisits = await ReferralVisit.getRewardEligibleVisits(referrerId);
+    
+    res.json({
+      success: true,
+      message: 'Visit rewards checked',
+      eligibleVisits: eligibleVisits.length,
+      visits: eligibleVisits
+    });
+    
+  } catch (error) {
+    console.error('[TEST VISIT REWARDS]', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
 
 // Schedule offer notifications every 30 minutes
 cron.schedule('*/30 * * * *', async () => {
@@ -67,6 +243,17 @@ cron.schedule('*/30 * * * *', async () => {
     }
   } catch (err) {
     console.error('[CRON] Failed to send offer notifications:', err);
+  }
+});
+
+// Schedule banner cleanup every hour
+cron.schedule('0 * * * *', async () => {
+  try {
+    const Banner = (await import('./models/Banner.js')).default;
+    await Banner.handleExpiredBanners();
+    console.log('[CRON] Banner cleanup completed');
+  } catch (err) {
+    console.error('[CRON] Failed to cleanup expired banners:', err);
   }
 });
 

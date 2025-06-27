@@ -10,9 +10,11 @@ const upload = multer();
 router.post('/', upload.array('images', 5), productController.createProduct);
 router.put('/:id', upload.array('images', 5), productController.updateProduct);
 router.delete('/:id', productController.deleteProduct);
+router.put('/:id/featured', productController.toggleProductFeatured);
 
 // Product listing/detail (public)
 router.get('/', productController.getAllProducts);
+router.get('/featured', productController.getFeaturedProducts);
 router.get('/:id', productController.getProductById);
 
 // Reviews (user)
@@ -46,10 +48,5 @@ router.post('/cart/clear', authenticateUser, productController.clearCart);
 router.get('/users/all', productController.getAllUsers); // admin only in production
 // Admin: get all orders for a user
 router.get('/orders/user/:userId', productController.getOrdersByUserId); // admin only in production
-
-// Test communication services (admin only)
-router.post('/test/communications', productController.testCommunicationServices);
-// Test Brevo email service specifically (admin only)
-router.post('/test/brevo-emails', productController.testBrevoEmailService);
 
 export default router;
